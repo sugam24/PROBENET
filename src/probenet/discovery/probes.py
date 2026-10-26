@@ -4,7 +4,6 @@ from collections import Counter
 
 import httpx
 
-
 BASE_URL = "https://atlas.ripe.net/api/v2"
 
 

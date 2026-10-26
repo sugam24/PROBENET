@@ -5,7 +5,6 @@ from pathlib import Path
 
 from probenet.discovery.probes import fetch_probes
 
-
 MEASUREMENT_IDS = [1001, 1004, 1005]
 DATA_DIR = Path("data/raw")
 

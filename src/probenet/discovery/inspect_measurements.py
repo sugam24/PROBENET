@@ -4,7 +4,6 @@ import json
 
 import httpx
 
-
 BASE_URL = "https://atlas.ripe.net/api/v2"
 MEASUREMENT_IDS = [1001, 1004, 1005]
 

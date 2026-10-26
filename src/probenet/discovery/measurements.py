@@ -3,7 +3,6 @@ import asyncio
 
 import httpx
 
-
 BASE_URL = "https://atlas.ripe.net/api/v2"
 
 

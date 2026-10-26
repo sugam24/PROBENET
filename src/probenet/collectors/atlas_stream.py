@@ -4,7 +4,6 @@ import json
 
 from websockets.asyncio.client import connect
 
-
 STREAM_URL = (
     "wss://atlas-stream.ripe.net/stream/"
     "?client=probenet-learning"

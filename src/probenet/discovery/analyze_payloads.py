@@ -3,7 +3,6 @@ import json
 from collections import Counter
 from pathlib import Path
 
-
 MEASUREMENT_IDS = [1001, 1004, 1005]
 DATA_DIR = Path("data/raw")
 

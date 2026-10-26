@@ -5,7 +5,6 @@ import time
 
 from websockets.asyncio.client import connect
 
-
 STREAM_URL = "wss://atlas-stream.ripe.net/stream/?client=probenet-throughput"
 MEASUREMENT_ID = 1001
 DURATION_SECONDS = 60
