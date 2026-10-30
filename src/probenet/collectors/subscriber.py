@@ -10,6 +10,7 @@ from time import monotonic
 from pydantic import ValidationError
 from websockets.asyncio.client import connect
 
+from probenet.collectors.metrics import CollectorMetrics
 from probenet.collectors.raw_capture import RawCaptureWriter
 from probenet.contracts.atlas import AtlasPingResult
 from probenet.transforms.ping import normalize_ping
@@ -18,6 +19,7 @@ STREAM_URL = "wss://atlas-stream.ripe.net/stream/?client=probenet"
 CONFIG_PATH = Path("config/measurements.json")
 
 QUEUE_MAXSIZE = 1000
+METRICS_INTERVAL_SECONDS = 10
 RECONNECT_INITIAL_DELAY = 1
 RECONNECT_MAX_DELAY = 30
 CONNECT_TIMEOUT = 15
@@ -46,6 +48,7 @@ def load_measurements() -> list[int]:
         config = json.load(file)
 
     return config["measurement_ids"]
+
 
 def create_capture_writer():
     """Create an optional raw capture writer."""
@@ -77,8 +80,9 @@ async def read_messages(
     websocket,
     queue: asyncio.Queue,
     capture_writer=None,
+    metrics=None,
 ):
-    """Receive messages, optionally capture them, and enqueue them."""
+    """Receive, optionally capture, and enqueue WebSocket messages."""
     async for raw_message in websocket:
         received_at = datetime.now(timezone.utc)
 
@@ -87,9 +91,12 @@ async def read_messages(
 
         await queue.put((raw_message, received_at))
 
+        if metrics is not None:
+            metrics.record_received(queue.qsize())
 
-async def process_messages(queue: asyncio.Queue):
-    """Consumer: validate and normalize queued messages."""
+
+async def process_messages(queue: asyncio.Queue, metrics=None):
+    """Validate and normalize queued messages."""
     while True:
         raw_message, received_at = await queue.get()
 
@@ -97,17 +104,32 @@ async def process_messages(queue: asyncio.Queue):
             message = json.loads(raw_message)
 
             if not isinstance(message, list) or len(message) != 2:
-                log_event("unexpected_message", message_type="unknown")
+                if metrics is not None:
+                    metrics.record_invalid()
+
+                log_event(
+                    "unexpected_message",
+                    message_type="unknown",
+                )
                 continue
 
             event_type, payload = message
 
             if event_type != "atlas_result":
-                log_event("control_message", event_type=event_type)
+                if metrics is not None:
+                    metrics.record_control()
+
+                log_event(
+                    "control_message",
+                    event_type=event_type,
+                )
                 continue
 
             source = AtlasPingResult.model_validate(payload)
             normalized = normalize_ping(source, received_at)
+
+            if metrics is not None:
+                metrics.record_ping()
 
             log_event(
                 "ping_received",
@@ -119,6 +141,9 @@ async def process_messages(queue: asyncio.Queue):
             )
 
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            if metrics is not None:
+                metrics.record_invalid()
+
             log_event(
                 "invalid_message",
                 error_type=type(exc).__name__,
@@ -128,34 +153,74 @@ async def process_messages(queue: asyncio.Queue):
             queue.task_done()
 
 
-async def run_pipeline(websocket, queue: asyncio.Queue, capture_writer=None):
-    """Run producer and consumer with controlled shutdown."""
-    consumer = asyncio.create_task(process_messages(queue))
+async def report_metrics(
+    queue: asyncio.Queue,
+    metrics: CollectorMetrics,
+):
+    """Periodically publish collector health metrics."""
+    while True:
+        await asyncio.sleep(METRICS_INTERVAL_SECONDS)
+
+        log_event(
+            "collector_metrics",
+            **metrics.snapshot(queue.qsize()),
+        )
+
+
+async def run_pipeline(
+    websocket,
+    queue: asyncio.Queue,
+    capture_writer=None,
+    metrics=None,
+):
+    """Run the producer, consumer and optional metrics reporter."""
+    consumer = asyncio.create_task(process_messages(queue, metrics))
+
+    reporter = None
+
+    if metrics is not None:
+        reporter = asyncio.create_task(report_metrics(queue, metrics))
 
     try:
-        await read_messages(websocket, queue, capture_writer)
+        await read_messages(
+            websocket,
+            queue,
+            capture_writer,
+            metrics,
+        )
 
-        # Process remaining queued messages after the producer finishes.
+        # Drain queued messages after a normal WebSocket closure.
         await queue.join()
 
     finally:
-        # Stop the consumer even if the producer fails.
         consumer.cancel()
 
-        try:
-            await consumer
-        except asyncio.CancelledError:
-            pass
+        tasks = [consumer]
+
+        if reporter is not None:
+            reporter.cancel()
+            tasks.append(reporter)
+
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
+        if metrics is not None:
+            log_event(
+                "collector_metrics_final",
+                **metrics.snapshot(queue.qsize()),
+            )
 
 
 async def collect():
-    """Keep the RIPE Atlas subscriber running across disconnections."""
+    """Keep the RIPE Atlas collector running across disconnections."""
     measurement_ids = load_measurements()
     retry_delay = RECONNECT_INITIAL_DELAY
     capture_writer = create_capture_writer()
+    metrics = CollectorMetrics()
 
     while True:
-        # Reset connection tracking for each attempt.
         connected_at = None
 
         try:
@@ -181,14 +246,21 @@ async def collect():
                         },
                     ]
 
-                    await websocket.send(json.dumps(subscription))
+                    await websocket.send(
+                        json.dumps(subscription)
+                    )
 
                     log_event(
                         "subscription_sent",
                         measurement_id=measurement_id,
                     )
 
-                await run_pipeline(websocket, queue, capture_writer)
+                await run_pipeline(
+                    websocket,
+                    queue,
+                    capture_writer,
+                    metrics,
+                )
 
                 log_event(
                     "connection_closed",
@@ -203,7 +275,6 @@ async def collect():
             )
 
         except Exception as exc:
-            # Unexpected programming errors should remain visible.
             log_event(
                 "collector_failed",
                 error_type=type(exc).__name__,
@@ -211,7 +282,6 @@ async def collect():
             raise
 
         finally:
-            # Reset the retry delay only after a stable connection.
             if (
                 connected_at is not None
                 and monotonic() - connected_at >= STABLE_CONNECTION_SECONDS

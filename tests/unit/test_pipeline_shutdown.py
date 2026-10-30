@@ -31,7 +31,7 @@ async def test_pipeline_finishes_after_websocket_closes(monkeypatch):
 
     processed = []
 
-    async def fake_process_messages(queue):
+    async def fake_process_messages(queue, metrics=None):
         while True:
             message, received_at = await queue.get()
 
