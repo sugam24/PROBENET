@@ -21,7 +21,7 @@ class NormalizedPing(BaseModel):
     packets_sent: int = Field(ge=0)
     packets_received: int = Field(ge=0)
 
-    packet_loss_ratio: float = Field(ge=0, le=1)
+    packet_loss_ratio: float | None = Field(default=None, ge=0, le=1)
 
     average_rtt_ms: float | None = Field(default=None, ge=0)
     minimum_rtt_ms: float | None = Field(default=None, ge=0)
