@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 
 from pydantic import ValidationError
 from websockets.asyncio.client import connect
@@ -13,7 +14,12 @@ from probenet.transforms.ping import normalize_ping
 
 STREAM_URL = "wss://atlas-stream.ripe.net/stream/?client=probenet"
 CONFIG_PATH = Path("config/measurements.json")
+
 QUEUE_MAXSIZE = 1000
+RECONNECT_INITIAL_DELAY = 1
+RECONNECT_MAX_DELAY = 30
+CONNECT_TIMEOUT = 15
+STABLE_CONNECTION_SECONDS = 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +50,6 @@ async def read_messages(websocket, queue: asyncio.Queue):
     """Producer: receive WebSocket messages and enqueue them."""
     async for raw_message in websocket:
         received_at = datetime.now(timezone.utc)
-
         await queue.put((raw_message, received_at))
 
 
@@ -79,33 +84,115 @@ async def process_messages(queue: asyncio.Queue):
             )
 
         except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            log_event("invalid_message", error_type=type(exc).__name__)
+            log_event(
+                "invalid_message",
+                error_type=type(exc).__name__,
+            )
 
         finally:
             queue.task_done()
 
 
+async def run_pipeline(websocket, queue: asyncio.Queue):
+    """Run producer and consumer with controlled shutdown."""
+    consumer = asyncio.create_task(process_messages(queue))
+
+    try:
+        await read_messages(websocket, queue)
+
+        # Process remaining queued messages after the producer finishes.
+        await queue.join()
+
+    finally:
+        # Stop the consumer even if the producer fails.
+        consumer.cancel()
+
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+
+
 async def collect():
-    """Subscribe to selected measurements and process results."""
+    """Keep the RIPE Atlas subscriber running across disconnections."""
     measurement_ids = load_measurements()
+    retry_delay = RECONNECT_INITIAL_DELAY
 
-    queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+    while True:
+        # Reset connection tracking for each attempt.
+        connected_at = None
 
-    async with connect(STREAM_URL) as websocket:
-        log_event("connected", measurements=measurement_ids)
+        try:
+            queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
-        for measurement_id in measurement_ids:
-            subscription = [
-                "atlas_subscribe",
-                {"streamType": "result", "msm": measurement_id},
-            ]
+            async with connect(
+                STREAM_URL,
+                open_timeout=CONNECT_TIMEOUT,
+            ) as websocket:
+                connected_at = monotonic()
 
-            await websocket.send(json.dumps(subscription))
-            log_event("subscription_sent", measurement_id=measurement_id)
+                log_event(
+                    "connected",
+                    measurements=measurement_ids,
+                )
 
-        async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(read_messages(websocket, queue))
-            tasks.create_task(process_messages(queue))
+                for measurement_id in measurement_ids:
+                    subscription = [
+                        "atlas_subscribe",
+                        {
+                            "streamType": "result",
+                            "msm": measurement_id,
+                        },
+                    ]
+
+                    await websocket.send(json.dumps(subscription))
+
+                    log_event(
+                        "subscription_sent",
+                        measurement_id=measurement_id,
+                    )
+
+                await run_pipeline(websocket, queue)
+
+                log_event(
+                    "connection_closed",
+                    reason="stream_ended",
+                )
+
+        except (OSError, TimeoutError, ConnectionError) as exc:
+            log_event(
+                "connection_error",
+                error_type=type(exc).__name__,
+                retry_delay_seconds=retry_delay,
+            )
+
+        except Exception as exc:
+            # Unexpected programming errors should remain visible.
+            log_event(
+                "collector_failed",
+                error_type=type(exc).__name__,
+            )
+            raise
+
+        finally:
+            # Reset the retry delay only after a stable connection.
+            if (
+                connected_at is not None
+                and monotonic() - connected_at >= STABLE_CONNECTION_SECONDS
+            ):
+                retry_delay = RECONNECT_INITIAL_DELAY
+
+        log_event(
+            "reconnecting",
+            delay_seconds=retry_delay,
+        )
+
+        await asyncio.sleep(retry_delay)
+
+        retry_delay = min(
+            retry_delay * 2,
+            RECONNECT_MAX_DELAY,
+        )
 
 
 if __name__ == "__main__":
