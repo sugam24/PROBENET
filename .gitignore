@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 .env
 /data/raw/
+
+# Local collector logs and smoke-test outputs
+data/logs/
