@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -9,6 +10,7 @@ from time import monotonic
 from pydantic import ValidationError
 from websockets.asyncio.client import connect
 
+from probenet.collectors.raw_capture import RawCaptureWriter
 from probenet.contracts.atlas import AtlasPingResult
 from probenet.transforms.ping import normalize_ping
 
@@ -45,11 +47,44 @@ def load_measurements() -> list[int]:
 
     return config["measurement_ids"]
 
+def create_capture_writer():
+    """Create an optional raw capture writer."""
+    enabled = os.getenv("PROBENET_CAPTURE_ENABLED", "false").lower()
 
-async def read_messages(websocket, queue: asyncio.Queue):
-    """Producer: receive WebSocket messages and enqueue them."""
+    if enabled != "true":
+        return None
+
+    path = Path(
+        os.getenv(
+            "PROBENET_CAPTURE_PATH",
+            "data/raw/live_capture.jsonl",
+        )
+    )
+
+    max_events = int(
+        os.getenv("PROBENET_CAPTURE_MAX_EVENTS", "1000")
+    )
+
+    if path.exists():
+        raise FileExistsError(
+            f"Capture file already exists: {path}"
+        )
+
+    return RawCaptureWriter(path=path, max_events=max_events)
+
+
+async def read_messages(
+    websocket,
+    queue: asyncio.Queue,
+    capture_writer=None,
+):
+    """Receive messages, optionally capture them, and enqueue them."""
     async for raw_message in websocket:
         received_at = datetime.now(timezone.utc)
+
+        if capture_writer is not None:
+            capture_writer.write(raw_message, received_at)
+
         await queue.put((raw_message, received_at))
 
 
@@ -93,12 +128,12 @@ async def process_messages(queue: asyncio.Queue):
             queue.task_done()
 
 
-async def run_pipeline(websocket, queue: asyncio.Queue):
+async def run_pipeline(websocket, queue: asyncio.Queue, capture_writer=None):
     """Run producer and consumer with controlled shutdown."""
     consumer = asyncio.create_task(process_messages(queue))
 
     try:
-        await read_messages(websocket, queue)
+        await read_messages(websocket, queue, capture_writer)
 
         # Process remaining queued messages after the producer finishes.
         await queue.join()
@@ -117,6 +152,7 @@ async def collect():
     """Keep the RIPE Atlas subscriber running across disconnections."""
     measurement_ids = load_measurements()
     retry_delay = RECONNECT_INITIAL_DELAY
+    capture_writer = create_capture_writer()
 
     while True:
         # Reset connection tracking for each attempt.
@@ -152,7 +188,7 @@ async def collect():
                         measurement_id=measurement_id,
                     )
 
-                await run_pipeline(websocket, queue)
+                await run_pipeline(websocket, queue, capture_writer)
 
                 log_event(
                     "connection_closed",

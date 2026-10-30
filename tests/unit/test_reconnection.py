@@ -28,7 +28,7 @@ async def test_collector_reconnects_after_connection_failure(monkeypatch):
 
         yield FakeWebSocket()
 
-    async def fake_run_pipeline(websocket, queue):
+    async def fake_run_pipeline(websocket, queue, capture_writer=None):
         # End the test after successful reconnection.
         raise asyncio.CancelledError()
 
@@ -116,7 +116,7 @@ async def test_backoff_resets_after_stable_connection(monkeypatch):
 
         yield
 
-    async def fake_run_pipeline(websocket, queue):
+    async def fake_run_pipeline(websocket, queue, capture_writer=None):
         # Pretend the connection stayed healthy for 65 seconds.
         current_time[0] += 65
 
