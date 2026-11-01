@@ -13,6 +13,11 @@ from websockets.asyncio.client import connect
 from probenet.collectors.metrics import CollectorMetrics
 from probenet.collectors.raw_capture import RawCaptureWriter
 from probenet.contracts.atlas import AtlasPingResult
+from probenet.storage.database import get_engine
+from probenet.storage.ping_repository import (
+    PayloadConflictError,
+    save_ping,
+)
 from probenet.transforms.ping import normalize_ping
 
 STREAM_URL = "wss://atlas-stream.ripe.net/stream/?client=probenet"
@@ -95,59 +100,91 @@ async def read_messages(
             metrics.record_received(queue.qsize())
 
 
-async def process_messages(queue: asyncio.Queue, metrics=None):
-    """Validate and normalize queued messages."""
+async def process_messages(
+    queue: asyncio.Queue,
+    metrics=None,
+    engine=None,
+):
+    """Validate, normalize and persist queued ping observations."""
     while True:
         raw_message, received_at = await queue.get()
 
         try:
-            message = json.loads(raw_message)
+            try:
+                message = json.loads(raw_message)
 
-            if not isinstance(message, list) or len(message) != 2:
+                if not isinstance(message, list) or len(message) != 2:
+                    if metrics is not None:
+                        metrics.record_invalid()
+
+                    log_event(
+                        "unexpected_message",
+                        message_type="unknown",
+                    )
+                    continue
+
+                event_type, payload = message
+
+                if event_type != "atlas_result":
+                    if metrics is not None:
+                        metrics.record_control()
+
+                    log_event(
+                        "control_message",
+                        event_type=event_type,
+                    )
+                    continue
+
+                source = AtlasPingResult.model_validate(payload)
+                normalized = normalize_ping(source, received_at)
+
+            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 if metrics is not None:
                     metrics.record_invalid()
 
                 log_event(
-                    "unexpected_message",
-                    message_type="unknown",
+                    "invalid_message",
+                    error_type=type(exc).__name__,
                 )
                 continue
-
-            event_type, payload = message
-
-            if event_type != "atlas_result":
-                if metrics is not None:
-                    metrics.record_control()
-
-                log_event(
-                    "control_message",
-                    event_type=event_type,
-                )
-                continue
-
-            source = AtlasPingResult.model_validate(payload)
-            normalized = normalize_ping(source, received_at)
 
             if metrics is not None:
                 metrics.record_ping()
 
-            log_event(
-                "ping_received",
-                measurement_id=normalized.measurement_id,
-                probe_id=normalized.probe_id,
-                event_time=normalized.event_time.isoformat(),
-                packet_loss_ratio=normalized.packet_loss_ratio,
-                average_rtt_ms=normalized.average_rtt_ms,
-            )
+            try:
+                result = await asyncio.to_thread(
+                    save_ping,
+                    engine,
+                    source,
+                    normalized,
+                )
 
-        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            except PayloadConflictError:
+                if metrics is not None:
+                    metrics.record_conflict()
+
+                log_event(
+                    "ping_conflict_recorded",
+                    measurement_id=normalized.measurement_id,
+                    probe_id=normalized.probe_id,
+                    event_time=normalized.event_time.isoformat(),
+                )
+                continue
+
+            except Exception as exc:
+                if metrics is not None:
+                    metrics.record_storage_error()
+
+                log_event(
+                    "storage_error",
+                    measurement_id=normalized.measurement_id,
+                    probe_id=normalized.probe_id,
+                    error_type=type(exc).__name__,
+                )
+                raise
+
             if metrics is not None:
-                metrics.record_invalid()
-
-            log_event(
-                "invalid_message",
-                error_type=type(exc).__name__,
-            )
+                metrics.record_storage_result(result)
 
         finally:
             queue.task_done()
@@ -167,33 +204,90 @@ async def report_metrics(
         )
 
 
+
+
 async def run_pipeline(
     websocket,
     queue: asyncio.Queue,
     capture_writer=None,
     metrics=None,
+    engine=None,
 ):
-    """Run the producer, consumer and optional metrics reporter."""
-    consumer = asyncio.create_task(process_messages(queue, metrics))
+    """Run producer and consumer with controlled shutdown."""
 
-    reporter = None
+    consumer = asyncio.create_task(
+        process_messages(queue, metrics, engine)
+    )
 
-    if metrics is not None:
-        reporter = asyncio.create_task(report_metrics(queue, metrics))
-
-    try:
-        await read_messages(
+    producer = asyncio.create_task(
+        read_messages(
             websocket,
             queue,
             capture_writer,
             metrics,
         )
+    )
 
-        # Drain queued messages after a normal WebSocket closure.
-        await queue.join()
+    reporter = None
+
+    if metrics is not None:
+        reporter = asyncio.create_task(
+            report_metrics(queue, metrics)
+        )
+
+    try:
+        done, _ = await asyncio.wait(
+            {producer, consumer},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if consumer in done:
+            await consumer
+            raise RuntimeError("Consumer stopped unexpectedly")
+
+        await producer
+
+        drain = asyncio.create_task(queue.join())
+
+        try:
+            done, _ = await asyncio.wait(
+                {drain, consumer},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if consumer in done:
+                await consumer
+                raise RuntimeError("Consumer stopped during queue drain")
+
+            await drain
+        finally:
+            if not drain.done():
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
 
     finally:
-        consumer.cancel()
+        # Stop the producer first, so no more messages enter the queue.
+        if not producer.done():
+            producer.cancel()
+
+        await asyncio.gather(
+            producer,
+            return_exceptions=True,
+        )
+
+        # On ordinary shutdown, allow queued messages to finish.
+        if not consumer.done():
+            try:
+                await asyncio.wait_for(queue.join(), timeout=15)
+            except asyncio.TimeoutError:
+                log_event(
+                    "shutdown_drain_timeout",
+                    pending_messages=queue.qsize(),
+                )
+
+        # Stop processing only after draining or timeout.
+        if not consumer.done():
+            consumer.cancel()
 
         tasks = [consumer]
 
@@ -219,86 +313,93 @@ async def collect():
     retry_delay = RECONNECT_INITIAL_DELAY
     capture_writer = create_capture_writer()
     metrics = CollectorMetrics()
+    engine = get_engine()
 
-    while True:
-        connected_at = None
+    try:
+        while True:
+            connected_at = None
 
-        try:
-            queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+            try:
+                queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
-            async with connect(
-                STREAM_URL,
-                open_timeout=CONNECT_TIMEOUT,
-            ) as websocket:
-                connected_at = monotonic()
+                async with connect(
+                    STREAM_URL,
+                    open_timeout=CONNECT_TIMEOUT,
+                ) as websocket:
+                    connected_at = monotonic()
 
-                log_event(
-                    "connected",
-                    measurements=measurement_ids,
-                )
+                    log_event(
+                        "connected",
+                        measurements=measurement_ids,
+                    )
 
-                for measurement_id in measurement_ids:
-                    subscription = [
-                        "atlas_subscribe",
-                        {
-                            "streamType": "result",
-                            "msm": measurement_id,
-                        },
-                    ]
+                    for measurement_id in measurement_ids:
+                        subscription = [
+                            "atlas_subscribe",
+                            {
+                                "streamType": "result",
+                                "msm": measurement_id,
+                            },
+                        ]
 
-                    await websocket.send(
-                        json.dumps(subscription)
+                        await websocket.send(
+                            json.dumps(subscription)
+                        )
+
+                        log_event(
+                            "subscription_sent",
+                            measurement_id=measurement_id,
+                        )
+
+                    await run_pipeline(
+                        websocket,
+                        queue,
+                        capture_writer,
+                        metrics,
+                        engine,
                     )
 
                     log_event(
-                        "subscription_sent",
-                        measurement_id=measurement_id,
+                        "connection_closed",
+                        reason="stream_ended",
                     )
 
-                await run_pipeline(
-                    websocket,
-                    queue,
-                    capture_writer,
-                    metrics,
-                )
-
+            except (OSError, TimeoutError, ConnectionError) as exc:
                 log_event(
-                    "connection_closed",
-                    reason="stream_ended",
+                    "connection_error",
+                    error_type=type(exc).__name__,
+                    retry_delay_seconds=retry_delay,
                 )
 
-        except (OSError, TimeoutError, ConnectionError) as exc:
+            except Exception as exc:
+                log_event(
+                    "collector_failed",
+                    error_type=type(exc).__name__,
+                )
+                raise
+
+            finally:
+                if (
+                    connected_at is not None
+                    and monotonic() - connected_at
+                    >= STABLE_CONNECTION_SECONDS
+                ):
+                    retry_delay = RECONNECT_INITIAL_DELAY
+
             log_event(
-                "connection_error",
-                error_type=type(exc).__name__,
-                retry_delay_seconds=retry_delay,
+                "reconnecting",
+                delay_seconds=retry_delay,
             )
 
-        except Exception as exc:
-            log_event(
-                "collector_failed",
-                error_type=type(exc).__name__,
+            await asyncio.sleep(retry_delay)
+
+            retry_delay = min(
+                retry_delay * 2,
+                RECONNECT_MAX_DELAY,
             )
-            raise
 
-        finally:
-            if (
-                connected_at is not None
-                and monotonic() - connected_at >= STABLE_CONNECTION_SECONDS
-            ):
-                retry_delay = RECONNECT_INITIAL_DELAY
-
-        log_event(
-            "reconnecting",
-            delay_seconds=retry_delay,
-        )
-
-        await asyncio.sleep(retry_delay)
-
-        retry_delay = min(
-            retry_delay * 2,
-            RECONNECT_MAX_DELAY,
-        )
+    finally:
+        await asyncio.to_thread(engine.dispose)
 
 
 if __name__ == "__main__":
