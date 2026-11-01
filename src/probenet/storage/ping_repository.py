@@ -1,3 +1,4 @@
+
 import json
 
 from sqlalchemy import text
@@ -16,20 +17,81 @@ class _DuplicatePing(Exception):
     """Internal signal to roll back an identical duplicate."""
 
 
+def _record_conflict(
+    engine: Engine,
+    source: AtlasPingResult,
+    normalized: NormalizedPing,
+    incoming_hash: str,
+    raw_payload: str,
+) -> None:
+    """Durably record a conflicting payload without changing canonical data."""
+
+    with engine.begin() as connection:
+        result = connection.execute(
+            text("""
+                INSERT INTO ping_conflicts (
+                    canonical_raw_result_id,
+                    incoming_payload_hash,
+                    incoming_payload,
+                    received_at
+                )
+                SELECT
+                    f.raw_result_id,
+                    :incoming_hash,
+                    CAST(:incoming_payload AS JSONB),
+                    :received_at
+                FROM fact_ping AS f
+                WHERE f.measurement_id = :measurement_id
+                  AND f.probe_id = :probe_id
+                  AND f.event_time = :event_time
+                ON CONFLICT ON CONSTRAINT uq_ping_conflict_payload
+                DO NOTHING
+                RETURNING id
+            """),
+            {
+                "measurement_id": source.msm_id,
+                "probe_id": source.prb_id,
+                "event_time": normalized.event_time,
+                "incoming_hash": incoming_hash,
+                "incoming_payload": raw_payload,
+                "received_at": normalized.received_at,
+            },
+        ).scalar_one_or_none()
+
+        if result is None:
+            # Distinguish an already-recorded conflict from a
+            # canonical row that disappeared before recording.
+            existing = connection.execute(
+                text("""
+                    SELECT 1
+                    FROM fact_ping AS f
+                    JOIN ping_conflicts AS c
+                      ON c.canonical_raw_result_id = f.raw_result_id
+                    WHERE f.measurement_id = :measurement_id
+                      AND f.probe_id = :probe_id
+                      AND f.event_time = :event_time
+                      AND c.incoming_payload_hash = :incoming_hash
+                """),
+                {
+                    "measurement_id": source.msm_id,
+                    "probe_id": source.prb_id,
+                    "event_time": normalized.event_time,
+                    "incoming_hash": incoming_hash,
+                },
+            ).scalar_one_or_none()
+
+            if existing is None:
+                raise RuntimeError(
+                    "Could not persist conflict: canonical observation missing"
+                )
+
+
 def save_ping(
     engine: Engine,
     source: AtlasPingResult,
     normalized: NormalizedPing,
 ) -> str:
-    """Persist one ping atomically.
-
-    Returns:
-        "inserted": A new canonical observation was saved.
-        "duplicate": An identical observation already exists.
-
-    Raises:
-        PayloadConflictError: Same key, different source payload.
-    """
+    """Persist a canonical ping or detect an existing observation."""
 
     if (
         normalized.measurement_id != source.msm_id
@@ -144,5 +206,15 @@ def save_ping(
 
     except _DuplicatePing:
         return "duplicate"
+
+    except PayloadConflictError:
+        _record_conflict(
+            engine,
+            source,
+            normalized,
+            event_hash,
+            raw_payload,
+        )
+        raise
 
     return "inserted"
