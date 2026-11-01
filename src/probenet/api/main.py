@@ -301,3 +301,126 @@ def get_recent_pings(
             "limit": limit,
         },
     )
+
+
+# ---------------------------------------------------------
+# Data freshness and collection continuity
+# ---------------------------------------------------------
+
+
+class MonitoringResponse(BaseModel):
+    measurement_id: int
+    latest_received_at: datetime | None
+    age_seconds: float | None
+    freshness_status: str
+    recent_observation_count: int
+    active_five_minute_buckets: int
+    total_five_minute_buckets: int
+    continuity_percent: float
+    continuity_status: str
+
+
+@app.get(
+    "/measurements/{measurement_id}/monitoring",
+    response_model=MonitoringResponse,
+    tags=["Monitoring"],
+)
+def get_measurement_monitoring(
+    measurement_id: int,
+    request: Request,
+):
+    """Report observation freshness and recent ingestion continuity."""
+    ensure_measurement_exists(request, measurement_id)
+
+    rows = execute_query(
+        request,
+        """
+        WITH clock AS (
+            SELECT
+                now() AS checked_at,
+                date_bin(
+                    '5 minutes',
+                    now(),
+                    TIMESTAMPTZ '2000-01-01 00:00:00+00'
+                ) AS current_bucket
+        )
+        SELECT
+            MAX(f.received_at) AS latest_received_at,
+
+            EXTRACT(
+                EPOCH FROM (c.checked_at - MAX(f.received_at))
+            ) AS age_seconds,
+
+            COUNT(*) FILTER (
+                WHERE f.received_at >= c.checked_at - INTERVAL '1 hour'
+                  AND f.received_at <= c.checked_at
+            ) AS recent_observation_count,
+
+            COUNT(DISTINCT date_bin(
+                '5 minutes',
+                f.received_at,
+                TIMESTAMPTZ '2000-01-01 00:00:00+00'
+            )) FILTER (
+                WHERE f.received_at >=
+                    c.current_bucket - INTERVAL '55 minutes'
+                  AND f.received_at <= c.checked_at
+            ) AS active_five_minute_buckets
+
+        FROM clock AS c
+        LEFT JOIN fact_ping AS f
+            ON f.measurement_id = :measurement_id
+
+        GROUP BY c.checked_at, c.current_bucket
+        """,
+        {"measurement_id": measurement_id},
+    )
+
+    row = rows[0]
+
+    age = (
+        float(row["age_seconds"])
+        if row["age_seconds"] is not None
+        else None
+    )
+
+    active_buckets = int(row["active_five_minute_buckets"])
+    recent_count = int(row["recent_observation_count"])
+
+    total_buckets = 12
+    continuity_percent = round(
+        active_buckets / total_buckets * 100,
+        2,
+    )
+
+    # Freshness thresholds are initial operational defaults.
+    if age is None:
+        freshness_status = "no_data"
+    elif age < -60:
+        freshness_status = "clock_skew"
+    elif age <= 300:
+        freshness_status = "fresh"
+    elif age <= 900:
+        freshness_status = "delayed"
+    else:
+        freshness_status = "stale"
+
+    # Continuity means an interval contains at least one
+    # observation. It does not measure per-probe coverage.
+    if active_buckets == 0:
+        continuity_status = "no_recent_data"
+    elif active_buckets < 6:
+        continuity_status = "intermittent"
+    else:
+        continuity_status = "active"
+
+    return {
+        "measurement_id": measurement_id,
+        "latest_received_at": row["latest_received_at"],
+        "age_seconds": round(age, 2) if age is not None else None,
+        "freshness_status": freshness_status,
+        "recent_observation_count": recent_count,
+        "active_five_minute_buckets": active_buckets,
+        "total_five_minute_buckets": total_buckets,
+        "continuity_percent": continuity_percent,
+        "continuity_status": continuity_status,
+    }

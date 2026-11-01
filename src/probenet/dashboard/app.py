@@ -107,6 +107,101 @@ st.caption(
 
 
 # ---------------------------------------------------------
+# Data freshness and collection continuity
+# ---------------------------------------------------------
+
+monitoring = fetch_data(
+    f"/measurements/{measurement_id}/monitoring"
+)
+
+st.subheader("Data Collection Health")
+
+freshness = monitoring["freshness_status"]
+continuity = monitoring["continuity_status"]
+
+freshness_labels = {
+    "fresh": "Fresh",
+    "delayed": "Delayed",
+    "stale": "Stale",
+    "no_data": "No data",
+    "clock_skew": "Clock skew",
+}
+
+health_col1, health_col2, health_col3 = st.columns(3)
+
+age_seconds = monitoring["age_seconds"]
+
+with health_col1:
+    st.metric(
+        "Data Freshness",
+        freshness_labels.get(freshness, freshness),
+    )
+
+    if age_seconds is not None and age_seconds >= 0:
+        st.caption(
+            f"Last observation received "
+            f"{age_seconds / 60:.1f} minutes ago"
+        )
+
+with health_col2:
+    st.metric(
+        "Observations (Last Hour)",
+        f"{monitoring['recent_observation_count']:,}",
+    )
+
+with health_col3:
+    st.metric(
+        "Collection Continuity",
+        f"{monitoring['continuity_percent']:.1f}%",
+    )
+
+    st.caption(
+        f"{monitoring['active_five_minute_buckets']} of "
+        f"{monitoring['total_five_minute_buckets']} "
+        "recent five-minute intervals contain observations"
+    )
+
+if freshness == "stale":
+    st.error(
+        "Data is stale. ProbeNet has not received a new "
+        "stored observation for over 15 minutes."
+    )
+elif freshness == "delayed":
+    st.warning(
+        "Data collection appears delayed. The latest "
+        "stored observation is over 5 minutes old."
+    )
+elif freshness == "no_data":
+    st.warning(
+        "No observations have been stored for this measurement."
+    )
+elif freshness == "clock_skew":
+    st.warning(
+        "Stored receipt timestamps appear to be in the future. "
+        "Check the collector and database clocks."
+    )
+
+if continuity == "no_recent_data":
+    st.warning(
+        "No observations were received in the recent "
+        "five-minute monitoring buckets."
+    )
+elif continuity == "intermittent":
+    st.warning(
+        "Recent collection appears intermittent. Fewer "
+        "than half of the monitoring buckets contain data."
+    )
+
+st.caption(
+    "Collection continuity is a five-minute bucket activity "
+    "indicator, not a measure of participating probe coverage. "
+    "Refresh the dashboard to recalculate these values."
+)
+
+st.divider()
+
+
+# ---------------------------------------------------------
 # Fetch analytics and recent observations
 # ---------------------------------------------------------
 

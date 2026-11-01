@@ -14,6 +14,16 @@ def client(monkeypatch):
     def fake_execute_query(request, query, parameters=None):
         parameters = parameters or {}
 
+        if "WITH clock AS" in query:
+            return [
+                {
+                    "latest_received_at": "2026-11-01T10:53:15Z",
+                    "age_seconds": 3879.28,
+                    "recent_observation_count": 0,
+                    "active_five_minute_buckets": 0,
+                }
+        ]
+
         if "FROM dim_measurement" in query:
             if "WHERE measurement_id" in query:
                 if parameters["measurement_id"] == 999999:
@@ -139,3 +149,18 @@ def test_invalid_ping_limit_returns_422(client, limit):
     )
 
     assert response.status_code == 422
+
+def test_monitoring_reports_stale_data(client):
+    response = client.get("/measurements/1001/monitoring")
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["measurement_id"] == 1001
+    assert data["freshness_status"] == "stale"
+    assert data["recent_observation_count"] == 0
+    assert data["active_five_minute_buckets"] == 0
+    assert data["total_five_minute_buckets"] == 12
+    assert data["continuity_percent"] == 0.0
+    assert data["continuity_status"] == "no_recent_data"
