@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from probenet.backfill.http_retry import open_with_retries
 from probenet.contracts.atlas import AtlasPingResult
 from probenet.contracts.normalized import NormalizedPing
 from probenet.transforms.ping import normalize_ping
@@ -77,7 +78,7 @@ def build_results_url(
 
 
 def fetch_results(url: str) -> list[dict]:
-    """Retain the bounded M3.01 JSON-array retrieval method."""
+    """Fetch a small bounded JSON-array response with HTTP retries."""
     request = Request(
         url,
         headers={
@@ -86,7 +87,11 @@ def fetch_results(url: str) -> list[dict]:
         },
     )
 
-    with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+    with open_with_retries(
+        request,
+        opener=urlopen,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    ) as response:
         payload = response.read(MAX_RESPONSE_BYTES + 1)
 
     if len(payload) > MAX_RESPONSE_BYTES:
@@ -111,7 +116,7 @@ def stream_results(
     Each yielded item contains the validated source observation
     and its canonical normalized representation.
 
-    An invalid line causes the import to fail explicitly.
+    Invalid records and incomplete responses cause explicit failures.
     """
     request = Request(
         url,
@@ -124,7 +129,11 @@ def stream_results(
     bytes_read = 0
     line_number = 0
 
-    with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+    with open_with_retries(
+        request,
+        opener=urlopen,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    ) as response:
         while True:
             raw_line = response.readline(MAX_LINE_BYTES + 1)
 
@@ -160,8 +169,7 @@ def stream_results(
             try:
                 source = AtlasPingResult.model_validate(payload)
 
-                # REST has no local WebSocket receipt timestamp.
-                # Record when our backfill client processes the result.
+                # Historical retrieval time, not original source receipt.
                 received_at = datetime.now(timezone.utc)
 
                 normalized = normalize_ping(
@@ -244,7 +252,12 @@ def main() -> None:
                 first_normalized.model_dump_json(indent=2)
             )
 
-    except (ValueError, OSError, UnicodeError) as exc:
+    except (
+        ValueError,
+        OSError,
+        UnicodeError,
+        RuntimeError,
+    ) as exc:
         parser.exit(
             status=1,
             message=f"Historical retrieval failed: {exc}\n",
