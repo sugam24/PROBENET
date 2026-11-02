@@ -1,20 +1,27 @@
 
-"""Bounded RIPE Atlas historical results client (M3.01)."""
+"""Bounded and incremental RIPE Atlas historical results client."""
 
 import argparse
 import json
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from probenet.contracts.atlas import AtlasPingResult
+from probenet.contracts.normalized import NormalizedPing
+from probenet.transforms.ping import normalize_ping
+
 API_BASE_URL = "https://atlas.ripe.net/api/v2"
+
 MAX_WINDOW_SECONDS = 15 * 60
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_LINE_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 30
 
 
 def parse_utc(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp with an explicit UTC offset."""
+    """Parse an ISO-8601 timestamp with an explicit timezone."""
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
 
     if dt.tzinfo is None:
@@ -28,6 +35,7 @@ def build_results_url(
     start: datetime,
     stop: datetime,
     probe_ids: list[int] | None = None,
+    response_format: str = "json",
 ) -> str:
     """Validate a bounded interval and build its REST URL."""
     if measurement_id <= 0:
@@ -50,10 +58,13 @@ def build_results_url(
     if probe_ids is not None and any(pid <= 0 for pid in probe_ids):
         raise ValueError("Probe IDs must be positive.")
 
+    if response_format not in {"json", "txt"}:
+        raise ValueError("Unsupported response format.")
+
     params = {
         "start": int(start.timestamp()),
         "stop": int(stop.timestamp()),
-        "format": "json",
+        "format": response_format,
     }
 
     if probe_ids:
@@ -66,10 +77,7 @@ def build_results_url(
 
 
 def fetch_results(url: str) -> list[dict]:
-    """Fetch a small bounded response.
-
-    Retries and incremental parsing are introduced in M3.02/M3.03.
-    """
+    """Retain the bounded M3.01 JSON-array retrieval method."""
     request = Request(
         url,
         headers={
@@ -95,9 +103,83 @@ def fetch_results(url: str) -> list[dict]:
     return results
 
 
+def stream_results(
+    url: str,
+) -> Iterator[tuple[AtlasPingResult, NormalizedPing]]:
+    """Incrementally validate and normalize historical JSONL results.
+
+    Each yielded item contains the validated source observation
+    and its canonical normalized representation.
+
+    An invalid line causes the import to fail explicitly.
+    """
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json, text/plain",
+            "User-Agent": "ProbeNet-Learning/0.1",
+        },
+    )
+
+    bytes_read = 0
+    line_number = 0
+
+    with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        while True:
+            raw_line = response.readline(MAX_LINE_BYTES + 1)
+
+            if not raw_line:
+                break
+
+            line_number += 1
+            bytes_read += len(raw_line)
+
+            if len(raw_line) > MAX_LINE_BYTES:
+                raise ValueError(
+                    f"Line {line_number} exceeds the 1 MiB limit."
+                )
+
+            if bytes_read > MAX_RESPONSE_BYTES:
+                raise ValueError(
+                    "Historical response exceeds the 16 MiB "
+                    "safety limit. Request a smaller interval."
+                )
+
+            try:
+                payload = json.loads(raw_line)
+            except (ValueError, UnicodeError) as exc:
+                raise ValueError(
+                    f"Invalid JSON on line {line_number}"
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"Expected a JSON object on line {line_number}"
+                )
+
+            try:
+                source = AtlasPingResult.model_validate(payload)
+
+                # REST has no local WebSocket receipt timestamp.
+                # Record when our backfill client processes the result.
+                received_at = datetime.now(timezone.utc)
+
+                normalized = normalize_ping(
+                    source,
+                    received_at,
+                )
+
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid ping on line {line_number}: {exc}"
+                ) from exc
+
+            yield source, normalized
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch a bounded RIPE Atlas historical interval."
+        description="Stream a bounded RIPE Atlas historical interval."
     )
     parser.add_argument("--measurement", type=int, required=True)
     parser.add_argument("--start", required=True)
@@ -121,34 +203,52 @@ def main() -> None:
             start=start,
             stop=stop,
             probe_ids=args.probe_ids,
+            response_format="txt",
         )
 
         print(f"Request: {url}")
-
-        results = fetch_results(url)
-
         print(f"Measurement: {args.measurement}")
         print(f"Start UTC: {start.isoformat()}")
         print(f"Stop UTC: {stop.isoformat()}")
-        print(f"Fetched results: {len(results)}")
 
-        if results:
-            sample = results[0]
-            print("First result summary:")
+        count = 0
+        first_source = None
+        first_normalized = None
+
+        for source, normalized in stream_results(url):
+            count += 1
+
+            if first_source is None:
+                first_source = source
+                first_normalized = normalized
+
+        print(f"Validated historical pings: {count}")
+
+        if first_source is not None:
+            print("First validated source:")
             print(
                 json.dumps(
                     {
-                        "msm_id": sample.get("msm_id"),
-                        "prb_id": sample.get("prb_id"),
-                        "timestamp": sample.get("timestamp"),
-                        "type": sample.get("type"),
+                        "msm_id": first_source.msm_id,
+                        "prb_id": first_source.prb_id,
+                        "timestamp": first_source.timestamp,
+                        "type": first_source.type,
                     },
                     indent=2,
                 )
             )
 
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
-        parser.exit(status=1, message=f"Backfill request failed: {exc}\n")
+        if first_normalized is not None:
+            print("First normalized ping:")
+            print(
+                first_normalized.model_dump_json(indent=2)
+            )
+
+    except (ValueError, OSError, UnicodeError) as exc:
+        parser.exit(
+            status=1,
+            message=f"Historical retrieval failed: {exc}\n",
+        )
 
 
 if __name__ == "__main__":
