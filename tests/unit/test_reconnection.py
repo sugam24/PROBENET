@@ -2,6 +2,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -29,11 +30,11 @@ async def test_collector_reconnects_after_connection_failure(monkeypatch):
         yield FakeWebSocket()
 
     async def fake_run_pipeline(
-    websocket,
-    queue,
-    capture_writer=None,
-    metrics=None,
-    engine=None,
+        websocket,
+        queue,
+        capture_writer=None,
+        metrics=None,
+        engine=None,
     ):
         # End the test after successful reconnection.
         raise asyncio.CancelledError()
@@ -44,6 +45,7 @@ async def test_collector_reconnects_after_connection_failure(monkeypatch):
     monkeypatch.setattr(subscriber, "connect", fake_connect)
     monkeypatch.setattr(subscriber, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(subscriber.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(subscriber, "get_engine", MagicMock())
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(subscriber.collect(), timeout=2)
@@ -86,6 +88,7 @@ async def test_exponential_backoff_after_repeated_failures(monkeypatch):
 
     monkeypatch.setattr(subscriber, "connect", fake_connect)
     monkeypatch.setattr(subscriber.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(subscriber, "get_engine", MagicMock())
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(subscriber.collect(), timeout=2)
@@ -124,11 +127,11 @@ async def test_backoff_resets_after_stable_connection(monkeypatch):
         yield
 
     async def fake_run_pipeline(
-    websocket,
-    queue,
-    capture_writer=None,
-    metrics=None,
-    engine=None,
+        websocket,
+        queue,
+        capture_writer=None,
+        metrics=None,
+        engine=None,
     ):
         # Pretend the connection stayed healthy for 65 seconds.
         current_time[0] += 65
@@ -139,6 +142,7 @@ async def test_backoff_resets_after_stable_connection(monkeypatch):
     monkeypatch.setattr(subscriber, "connect", fake_connect)
     monkeypatch.setattr(subscriber, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(subscriber.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(subscriber, "get_engine", MagicMock())
     monkeypatch.setattr(
         subscriber,
         "monotonic",
@@ -176,6 +180,7 @@ async def test_backoff_never_exceeds_maximum(monkeypatch):
 
     monkeypatch.setattr(subscriber, "connect", fake_connect)
     monkeypatch.setattr(subscriber.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(subscriber, "get_engine", MagicMock())
 
     with pytest.raises(asyncio.CancelledError):
         await subscriber.collect()
@@ -203,6 +208,7 @@ async def test_connection_timeout_is_retried(monkeypatch):
 
     monkeypatch.setattr(subscriber, "connect", fake_connect)
     monkeypatch.setattr(subscriber.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(subscriber, "get_engine", MagicMock())
 
     with pytest.raises(asyncio.CancelledError):
         await subscriber.collect()
